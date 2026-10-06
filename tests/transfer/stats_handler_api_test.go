@@ -1,0 +1,162 @@
+package transfer_test
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+	"time"
+
+	transfer_handler "github.com/MamangRust/monolith-payment-gateway-apigateway/handler/transfer"
+
+	"github.com/MamangRust/monolith-payment-gateway-apigateway/apierror"
+	pb "github.com/MamangRust/monolith-payment-gateway-pb/transfer/stats"
+	"github.com/MamangRust/monolith-payment-gateway-pkg/logger"
+	"github.com/MamangRust/monolith-payment-gateway-shared/cache"
+	"github.com/MamangRust/monolith-payment-gateway-shared/observability"
+	tests "github.com/MamangRust/monolith-payment-gateway-test"
+	"github.com/MamangRust/monolith-payment-gateway-transfer/handler"
+	"github.com/MamangRust/monolith-payment-gateway-transfer/repository"
+	"github.com/MamangRust/monolith-payment-gateway-transfer/service"
+	"github.com/go-chi/chi/v5"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/suite"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
+
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+type TransferStatsHandlerApiTestSuite struct {
+	suite.Suite
+	ts          *tests.TestSuite
+	echo        chi.Router
+	lis         *bufconn.Listener
+	conn        *grpc.ClientConn
+	userID      int32
+	cardNumber1 string
+	cardNumber2 string
+	testYear    int
+	testMonth   int
+	cleanup     func()
+}
+
+func (s *TransferStatsHandlerApiTestSuite) SetupSuite() {
+	ts, err := tests.SetupTestSuite()
+	s.Require().NoError(err)
+	s.ts = ts
+
+	gormDB, gormErr := gorm.Open(postgres.Open(s.ts.DBURL), &gorm.Config{})
+	if gormErr != nil {
+		s.Require().NoError(gormErr)
+	}
+
+	zapLog := zap.NewNop()
+	myLogger := &logger.Logger{Log: zapLog}
+
+	redisOption, err := redis.ParseURL(s.ts.RedisURL)
+	s.Require().NoError(err)
+	redisClient := redis.NewClient(redisOption)
+	cacheStore := cache.NewCacheStore(redisClient, myLogger, &dummyCacheMetrics{})
+
+	_, _, cleanup, err := tests.StartCardInfra(gormDB, myLogger, cacheStore)
+	s.Require().NoError(err)
+	s.cleanup = cleanup
+
+	repos := repository.NewRepositories(gormDB, tests.NewCardQueryClient(gormDB), tests.NewCardCommandClient(gormDB), tests.NewSaldoQueryClient(gormDB), tests.NewSaldoCommandClient(gormDB))
+
+	svc := service.NewService(&service.Deps{
+		Kafka:        nil,
+		Repositories: repos,
+		Logger:       myLogger,
+		Cache:        cacheStore,
+	})
+
+	h := handler.NewHandler(svc)
+
+	s.lis = bufconn.Listen(1024 * 1024)
+	server := grpc.NewServer()
+	pb.RegisterTransferStatsStatusServiceServer(server, h)
+
+	go func() {
+		if err := server.Serve(s.lis); err != nil {
+		}
+	}()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return s.lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	s.Require().NoError(err)
+	s.conn = conn
+
+	s.echo = chi.NewRouter()
+	obs, _ := observability.NewObservability("test", myLogger)
+	apiHandler := apierror.NewApiHandler(obs, myLogger)
+
+	transfer_handler.RegisterTransferHandler(&transfer_handler.DepsTransfer{
+		Client:     s.conn,
+		Router:     s.echo,
+		Logger:     myLogger,
+		Cache:      cacheStore,
+		ApiHandler: apiHandler,
+	})
+
+	s.testYear = time.Now().Year()
+	s.testMonth = int(time.Now().Month())
+
+	ctx := context.Background()
+	err = gormDB.WithContext(ctx).Raw("INSERT INTO users (firstname, lastname, email, password, verification_code, is_verified) VALUES ('TransferApi', 'Stats', 'transfer_api_stats@example.com', 'pass', '123', true) RETURNING user_id").Scan(&s.userID).Error
+	s.Require().NoError(err)
+
+	s.cardNumber1 = "2222111100009999"
+	s.cardNumber2 = "3333444455556666"
+	err = gormDB.WithContext(ctx).Exec("INSERT INTO cards (user_id, card_number, card_type, cvv, card_provider, expire_date) VALUES (?, ?, 'debit', '123', 'visa', '2030-01-01')", s.userID, s.cardNumber1).Error
+	s.Require().NoError(err)
+	err = gormDB.WithContext(ctx).Exec("INSERT INTO cards (user_id, card_number, card_type, cvv, card_provider, expire_date) VALUES (?, ?, 'debit', '123', 'mastercard', '2030-01-01')", s.userID, s.cardNumber2).Error
+	s.Require().NoError(err)
+
+	err = gormDB.WithContext(ctx).Exec("INSERT INTO transfers (transfer_from, transfer_to, transfer_amount, transfer_time, status) VALUES (?, ?, ?, ?, 'success')",
+		s.cardNumber1, s.cardNumber2, 250000, time.Date(s.testYear, time.Month(s.testMonth), 10, 10, 0, 0, 0, time.UTC)).Error
+	s.Require().NoError(err)
+}
+
+func (s *TransferStatsHandlerApiTestSuite) TearDownSuite() {
+	if s.conn != nil {
+		s.conn.Close()
+	}
+	if s.lis != nil {
+		s.lis.Close()
+	}
+	if s.cleanup != nil {
+		s.cleanup()
+	}
+	s.ts.Teardown()
+}
+
+func (s *TransferStatsHandlerApiTestSuite) TestFindMonthlyTransferStatusSuccess() {
+	month := strconv.Itoa(s.testMonth)
+	year := strconv.Itoa(s.testYear)
+	req := httptest.NewRequest(http.MethodGet, "/api/transfer-stats-status/monthly-success?year="+year+"&month="+month, nil)
+	rec := httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+
+	s.Equal(http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	s.Equal("success", resp["status"])
+}
+
+func TestTransferStatsHandlerApiSuite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	suite.Run(t, new(TransferStatsHandlerApiTestSuite))
+}
